@@ -14,15 +14,19 @@ import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Hashtable;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Scanner;
 import ghidra.app.decompiler.ClangTokenGroup;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.emulator.Emulator;
 import ghidra.app.emulator.EmulatorHelper;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.model.DomainFolder;
+import ghidra.framework.options.Options;
 import ghidra.framework.options.ToolOptions;
 import ghidra.framework.plugintool.util.OptionsService;
 import ghidra.util.InvalidNameException;
@@ -31,6 +35,7 @@ import ghidra.util.exception.DuplicateFileException;
 import ghidra.util.exception.DuplicateNameException;
 import ghidra.util.exception.FileInUseException;
 import ghidra.util.exception.VersionException;
+import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.*;
 import ghidra.program.model.data.Enum;
@@ -44,6 +49,8 @@ import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.PcodeOpAST;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.pcode.VarnodeAST;
+import ghidra.pcode.emulate.EmulateExecutionState;
+import ghidra.pcode.memstate.MemoryState;
 import ghidra.pcode.opbehavior.*;
 
 /**
@@ -63,13 +70,16 @@ import ghidra.pcode.opbehavior.*;
  */
 
 public class Alchemy extends GhidraScript {
-	static final boolean ECHO_TO_STDOUT = true;
-	static final int NUM_ITERATIONS = 1;
-	static final String TEMP_FOLDER = "~Alchemy";
 	static final String COMPILER_PATH = "/Users/theo/tmc/tools/agbcc/bin/agbcc";
+	static final String COMPILER_OPTIONS = "-O2";
 	static final String INCLUDE_PATH = "/Users/theo/tmc/tools/agbcc/include";
 	static final String ASSEMBLER_PATH = "/System/Volumes/Data/opt/devkitpro/devkitARM/bin/arm-none-eabi-as";
-	static final String COMPILER_OPTIONS = "-O2";
+
+	static final String TEMP_FOLDER = "~Alchemy";
+	static final int NUM_ITERATIONS = 1;
+	static final boolean TRY_EMU_CALLS = false;
+
+	static final boolean DEBUG = true;
 
 	Context ctx = new Context();
 	DecompInterface idec;
@@ -110,7 +120,13 @@ public class Alchemy extends GhidraScript {
 			// Start a new transaction for the entire step
 			transactionHandle = program.startTransaction("Alchemy");
 
-			analyzeAll(program);
+			// "Apply Data Archives" creates errors ... disable it
+			// we need to initialize analysis options before removing one
+			AutoAnalysisManager ana_mgr = AutoAnalysisManager.getAnalysisManager(program);
+			ana_mgr.initializeOptions();
+			setAnalysisOption(program, "Apply Data Archives", "false");
+			ana_mgr.startAnalysis(new ConsoleTaskMonitor());
+
 			FunctionIterator fiter = program.getListing().getFunctions(true);
 			if (!fiter.hasNext()) {
 				throw new RuntimeException("A compile error occured and no function was generated!");
@@ -125,11 +141,14 @@ public class Alchemy extends GhidraScript {
 				// end the transaction so we can delete the old program
 				program.endTransaction(transactionHandle, true);
 				program.release(this);
-				try {
-					program.getDomainFile().delete();
-				} catch (IOException e) {
-					e.printStackTrace();
+				if (!DEBUG) {
+					try {
+						program.getDomainFile().delete();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
 				}
+				program = null;
 			}
 		}
 	}
@@ -146,22 +165,8 @@ public class Alchemy extends GhidraScript {
 		typedefs.append("typedef int64_t s64;\n");
 	}
 
-	String generateFile() throws IOException {
-		//PrintWriter pw = new PrintWriter(tu);
+	String generateFile() {
 		StringBuilder pw = new StringBuilder();
-//		for (int i = 0; i < proto.getNumParams(); ++i) {
-//			HighSymbol hs = proto.getParam(i);
-//			DataType dt = hs.getDataType();
-//			if (dt instanceof BuiltInDataType) {
-//			}
-//		}
-
-//		Iterator<HighSymbol> locals = target.getLocalSymbolMap().getSymbols();
-//		while (locals.hasNext()) {
-//			HighSymbol s = locals.next();
-//			print(s.getDataType().getName() + " " + s.getName() + "\n");
-//		}
-
 		String proto = constructPrototype();
 		String body = constructBody();
 
@@ -177,10 +182,10 @@ public class Alchemy extends GhidraScript {
 		globals.forEach((k, v) -> {
 			pw.append("extern " + getTypeName(v) + " " + k + ";\n");
 		});
-		
+
 		// add functions
 		for (Function f : ext_functions) {
-			pw.append("extern " + getTypeName(f.getReturnType()) + " " + f.getName() + "();\n" );
+			pw.append("extern " + getTypeName(f.getReturnType()) + " " + f.getName() + "();\n");
 		}
 
 		// print function
@@ -192,12 +197,12 @@ public class Alchemy extends GhidraScript {
 		}
 		pw.append("}\n");
 
-		if (ECHO_TO_STDOUT) {
-			println("=====File Contents Begin=====");
-			print(pw.toString());
-			println("=====File Contents End=====");
-		}
-		
+//		if (DEBUG) {
+//			printf("=====File Contents Begin=====\n");
+//			printf("%s", pw.toString());
+//			printf("=====File Contents End=====\n");
+//		}
+//		
 		return pw.toString();
 	}
 
@@ -233,7 +238,7 @@ public class Alchemy extends GhidraScript {
 	 */
 	String constructBody() {
 		StringBuilder sb = new StringBuilder();
-		
+
 		Iterator<HighSymbol> global_iter = target.getGlobalSymbolMap().getSymbols();
 		while (global_iter.hasNext()) {
 			HighSymbol s = global_iter.next();
@@ -257,23 +262,96 @@ public class Alchemy extends GhidraScript {
 			sb.append(getTypeName(local.getDataType()) + " " + local.getName() + ";\n");
 		}
 
-		ArrayList<PcodeBlockBasic> blocks = target.getBasicBlocks();
-		for (PcodeBlockBasic block : blocks) {
-			Iterator<PcodeOp> children = block.getIterator();
-			while (children.hasNext()) {
-				PcodeOp c = children.next();
-				switch (c.getOpcode()) {
-				case PcodeOp.CALL:
-					Varnode in0 = c.getInput(0);
-					Function f = currentProgram.getFunctionManager().getFunctionAt(in0.getAddress());
-					registerFunction(f);
-					sb.append(f.getName() + "();\n");
+//		ArrayList<PcodeBlockBasic> blocks = target.getBasicBlocks();
+//		for (PcodeBlockBasic block : blocks) {
+//			Iterator<PcodeOp> children = block.getIterator();
+//			while (children.hasNext()) {
+//				PcodeOp c = children.next();
+//				switch (c.getOpcode()) {
+//				case PcodeOp.CALL:
+//					Varnode in0 = c.getInput(0);
+//					Function f = currentProgram.getFunctionManager().getFunctionAt(in0.getAddress());
+//					registerFunction(f);
+//					sb.append(f.getName() + "();\n");
+//				}
+//			}
+//		}
+
+		EmulatorHelper emuHelper = new EmulatorHelper(currentProgram);
+		println("fn end " + target.getFunction().getBody().getMaxAddress().toString());
+
+		final long bkpt_addr = 0xE0000000L;
+
+		long pc_addr = target.getFunction().getEntryPoint().getPhysicalAddress().getAddressableWordOffset();
+		long stack_addr = (target.getFunction().getEntryPoint().getAddressSpace().getMaxAddress().getOffset() >>> 1)
+				- 0x7fff;
+		printf("set emu pc to %x\n", pc_addr);
+		printf("set emu sp to %x\n", stack_addr);
+		emuHelper.writeRegister(emuHelper.getPCRegister(), pc_addr);
+		emuHelper.writeRegister(emuHelper.getStackPointerRegister(), stack_addr);
+		emuHelper.writeRegister(currentProgram.getProgramContext().getRegister("lr"), bkpt_addr);
+		emuHelper.setBreakpoint(currentProgram.getAddressFactory().getConstantAddress(bkpt_addr));
+
+		boolean fn_found = false;
+
+		emu: while (!monitor.isCancelled()) {
+			try {
+				step: switch (emuHelper.getEmulator().getEmulateExecutionState()) {
+				case BREAKPOINT:
+					printf("hit bkpt\n");
+					break emu;
+				case FAULT:
+					printf("emulate fault\n");
+					break emu;
+				case STOPPED:
+					Address pc = emuHelper.getExecutionAddress();
+					
+					if (pc.getOffset() == bkpt_addr) {
+						break emu;
+					}
+					
+					println("exec addr = " + emuHelper.getExecutionAddress());
+					Instruction inst = currentProgram.getListing().getInstructionAt(pc);
+					PcodeOp[] pcodes = inst.getPcode();
+					for (PcodeOp op : pcodes) {
+						if (op.getOpcode() == PcodeOp.CALL) {
+							printf("call @ %s\n", pc);
+							if (!TRY_EMU_CALLS) {
+								emuHelper.writeRegister("pc", inst.getNext().getAddress().getOffset());
+								// todo: why is the execution address delayed?
+							}
+						}
+					}
+//					Iterator<PcodeOpAST> ast_iter = target.getPcodeOps(pc);
+//					while (ast_iter.hasNext()) {
+//						PcodeOpAST ast = ast_iter.next();
+//						Iterator<PcodeOp> ops = ast.getBasicIter();
+//						while (ops.hasNext()) {
+//							PcodeOp op = ops.next();
+//							println(op.getMnemonic());
+//							if (op.getOpcode() == PcodeOp.CALL) {
+//								printf("call @ %s\n", pc);
+//								if (!TRY_EMU_CALLS) {
+//									//emuHelper.writeRegister("pc", currentProgram.getListing().getInstructionAfter(pc).getAddress().getOffsetAsBigInteger());
+//									// todo: why is the execution address delayed?
+//									// todo: how do we get JUST the pcode for a single instruction?
+//									break step;
+//								}
+//							}
+//						}
+//					}
+
+					emuHelper.step(new ConsoleTaskMonitor());
+				default:
+					break;
 				}
+			} catch (CancelledException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
 			}
 		}
 
-		// EmulatorHelper emuHelper = new EmulatorHelper(currentProgram);
-
+		printf("emu ended at %s\n", emuHelper.getExecutionAddress().toString());
 		return sb.toString();
 	}
 
@@ -295,18 +373,16 @@ public class Alchemy extends GhidraScript {
 				p_cnt++;
 				pointedTo = ((Pointer) pointedTo).getDataType();
 			}
-			
+
 			return (pointedTo instanceof Structure ? "struct " : "") + getTypeName(pointedTo) + "*".repeat(p_cnt);
 		}
 
 		if (dt instanceof BuiltInDataType) {
 			return builtinToTypedef(dt);
 		}
-
 		if (dt instanceof DefaultDataType) {
 			return "u8";
 		}
-
 		if (dt instanceof Composite) {
 			return registerComposite(dt);
 		}
@@ -373,14 +449,13 @@ public class Alchemy extends GhidraScript {
 
 		throw new RuntimeException("Builtin DataType " + dt.getName() + " could not be read.");
 	}
-	
+
 	String registerComposite(DataType dt) {
 		// todo: support union
 
 		if (!(dt instanceof Composite)) {
 			throw new RuntimeException("DataType is not a Composite: " + dt.getName());
 		}
-
 		if (dt instanceof Union) {
 			throw new RuntimeException("Sorry, unions are not supported yet.");
 		}
@@ -388,7 +463,7 @@ public class Alchemy extends GhidraScript {
 		Composite s = (Composite) dt;
 
 		if (!structs.containsKey(s)) {
-			// placeholder so Struct containing Struct* doesn't cause recursion
+			// dummy so Struct containing Struct* doesn't cause recursion
 			structs.put(s, "");
 
 			StringBuilder sb = new StringBuilder();
@@ -400,10 +475,10 @@ public class Alchemy extends GhidraScript {
 				}
 
 				String name = c.getFieldName() != null ? c.getFieldName() : c.getDefaultFieldName();
-				String arrCnt = c.getDataType() instanceof Array
+				String arr_count = c.getDataType() instanceof Array
 						? "[" + ((Array) c.getDataType()).getNumElements() + "]"
 						: "";
-				sb.append("\t" + ctype + " " + name + arrCnt + ";\n");
+				sb.append("\t" + ctype + " " + name + arr_count + ";\n");
 			}
 			sb.append("} " + s.getName() + ";\n");
 
@@ -412,23 +487,21 @@ public class Alchemy extends GhidraScript {
 
 		return s.getName();
 	}
-	
+
 	void registerFunction(Function f) {
 		ext_functions.add(f);
 	}
 
 	private DecompInterface setUpDecompiler(Program program) {
 		DecompInterface decomplib = new DecompInterface();
-
-		DecompileOptions options;
-		options = new DecompileOptions();
+		DecompileOptions options = new DecompileOptions();
 		OptionsService service = state.getTool().getService(OptionsService.class);
+
 		if (service != null) {
 			ToolOptions opt = service.getOptions("Decompiler");
 			options.grabFromToolAndProgram(null, opt, program);
 		}
 		decomplib.setOptions(options);
-
 		decomplib.toggleCCode(true);
 		decomplib.toggleSyntaxTree(true);
 		decomplib.setSimplificationStyle("decompile");
@@ -443,10 +516,7 @@ public class Alchemy extends GhidraScript {
 		target = decompRes.getHighFunction();
 		docroot = decompRes.getCCodeMarkup();
 
-		if (target == null)
-			return false;
-
-		return true;
+		return target != null;
 	}
 
 	/**
@@ -459,12 +529,10 @@ public class Alchemy extends GhidraScript {
 		try {
 			String cmd[] = { "/bin/sh", "-c", command };
 			Process process = Runtime.getRuntime().exec(cmd);
-
 			StringBuilder output = new StringBuilder();
-
 			BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-
 			String line;
+
 			while ((line = reader.readLine()) != null) {
 				output.append(line + "\n");
 			}
@@ -489,6 +557,7 @@ public class Alchemy extends GhidraScript {
 		File bin = null;
 		try {
 			bin = File.createTempFile("alchemy", ".o");
+			println(bin.getAbsolutePath());
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
@@ -496,18 +565,19 @@ public class Alchemy extends GhidraScript {
 		String cpp_command = String.format("cc -E -I%s - ", INCLUDE_PATH);
 		String cc_command = String.format("%s %s", COMPILER_PATH, COMPILER_OPTIONS);
 		String as_command = String.format("%s -o %s", ASSEMBLER_PATH, bin.getAbsoluteFile());
-		
+
 		sh("echo '" + tu + "' | " + cpp_command + " | " + cc_command + " | " + as_command);
-		
+
 		return bin;
 	}
 
 	DomainFolder getFolder() throws Exception {
 		DomainFolder root = getProjectRootFolder();
-		try {
-			root.createFolder(TEMP_FOLDER);
-		} catch (DuplicateFileException e) {
+		DomainFolder tmpFolder = root.getFolder(TEMP_FOLDER);
+		if (tmpFolder != null) {
+			return tmpFolder;
 		}
+		root.createFolder(TEMP_FOLDER);
 		return root.getFolder(TEMP_FOLDER);
 	}
 
@@ -518,14 +588,14 @@ public class Alchemy extends GhidraScript {
 		// Get the focused function in Ghidra.
 		Function fn = this.currentProgram.getListing().getFunctionContaining(currentAddress);
 		if (fn == null) {
-			print("Error: Must focus on a function to decompile.\n");
+			printerr("Must focus on a function to decompile.");
 			return;
 		}
 
 		idec = setUpDecompiler(currentProgram);
 		idec.openProgram(currentProgram);
 		if (!decompileFunction(fn, idec)) {
-			print("Error encountered while decompiling. Quitting.\n");
+			printerr("Ghidra failed to decompile the specified function.");
 			return;
 		}
 
@@ -537,10 +607,17 @@ public class Alchemy extends GhidraScript {
 		}
 		ctx.cleanupCtx();
 
-		try {
-			folder.delete();
-		} catch (FileInUseException e) {
-			print("Warning: unable to delete temp folder in database.\n");
+		if (!DEBUG) {
+			try {
+				folder.delete();
+			} catch (FileInUseException e) {
+				print("Warning: unable to delete temp folder in database.\n");
+			}
 		}
+	}
+
+	@Override
+	public void cleanup(boolean success) {
+		ctx.cleanupCtx();
 	}
 }
