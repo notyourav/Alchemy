@@ -11,6 +11,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Hashtable;
 import java.util.Iterator;
@@ -261,25 +262,10 @@ public class Alchemy extends GhidraScript {
 
 			sb.append(getTypeName(local.getDataType()) + " " + local.getName() + ";\n");
 		}
-
-//		ArrayList<PcodeBlockBasic> blocks = target.getBasicBlocks();
-//		for (PcodeBlockBasic block : blocks) {
-//			Iterator<PcodeOp> children = block.getIterator();
-//			while (children.hasNext()) {
-//				PcodeOp c = children.next();
-//				switch (c.getOpcode()) {
-//				case PcodeOp.CALL:
-//					Varnode in0 = c.getInput(0);
-//					Function f = currentProgram.getFunctionManager().getFunctionAt(in0.getAddress());
-//					registerFunction(f);
-//					sb.append(f.getName() + "();\n");
-//				}
-//			}
-//		}
-
+		
 		EmulatorHelper emuHelper = new EmulatorHelper(currentProgram);
 		println("fn end " + target.getFunction().getBody().getMaxAddress().toString());
-
+		
 		final long bkpt_addr = 0xE0000000L;
 
 		long pc_addr = target.getFunction().getEntryPoint().getPhysicalAddress().getAddressableWordOffset();
@@ -292,8 +278,6 @@ public class Alchemy extends GhidraScript {
 		emuHelper.writeRegister(currentProgram.getProgramContext().getRegister("lr"), bkpt_addr);
 		emuHelper.setBreakpoint(currentProgram.getAddressFactory().getConstantAddress(bkpt_addr));
 
-		boolean fn_found = false;
-
 		emu: while (!monitor.isCancelled()) {
 			try {
 				step: switch (emuHelper.getEmulator().getEmulateExecutionState()) {
@@ -302,6 +286,7 @@ public class Alchemy extends GhidraScript {
 					break emu;
 				case FAULT:
 					printf("emulate fault\n");
+					printerr(emuHelper.getLastError());
 					break emu;
 				case STOPPED:
 					Address pc = emuHelper.getExecutionAddress();
@@ -309,37 +294,18 @@ public class Alchemy extends GhidraScript {
 					if (pc.getOffset() == bkpt_addr) {
 						break emu;
 					}
-					
-					println("exec addr = " + emuHelper.getExecutionAddress());
+
 					Instruction inst = currentProgram.getListing().getInstructionAt(pc);
 					PcodeOp[] pcodes = inst.getPcode();
 					for (PcodeOp op : pcodes) {
 						if (op.getOpcode() == PcodeOp.CALL) {
-							printf("call @ %s\n", pc);
+							printf("skip call %s\n", currentProgram.getFunctionManager().getFunctionAt(op.getInput(0).getAddress()));
 							if (!TRY_EMU_CALLS) {
 								emuHelper.writeRegister("pc", inst.getNext().getAddress().getOffset());
-								// todo: why is the execution address delayed?
+								emuHelper.setContextRegister(currentProgram.getRegister("TMode"), BigInteger.valueOf(1));
 							}
 						}
 					}
-//					Iterator<PcodeOpAST> ast_iter = target.getPcodeOps(pc);
-//					while (ast_iter.hasNext()) {
-//						PcodeOpAST ast = ast_iter.next();
-//						Iterator<PcodeOp> ops = ast.getBasicIter();
-//						while (ops.hasNext()) {
-//							PcodeOp op = ops.next();
-//							println(op.getMnemonic());
-//							if (op.getOpcode() == PcodeOp.CALL) {
-//								printf("call @ %s\n", pc);
-//								if (!TRY_EMU_CALLS) {
-//									//emuHelper.writeRegister("pc", currentProgram.getListing().getInstructionAfter(pc).getAddress().getOffsetAsBigInteger());
-//									// todo: why is the execution address delayed?
-//									// todo: how do we get JUST the pcode for a single instruction?
-//									break step;
-//								}
-//							}
-//						}
-//					}
 
 					emuHelper.step(new ConsoleTaskMonitor());
 				default:
@@ -352,6 +318,7 @@ public class Alchemy extends GhidraScript {
 		}
 
 		printf("emu ended at %s\n", emuHelper.getExecutionAddress().toString());
+		emuHelper.dispose();
 		return sb.toString();
 	}
 
